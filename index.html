@@ -98,13 +98,13 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 .lobby-cancel:hover{color:rgba(255,255,255,.55)}
 
 /* ── D-PAD (mobile touch controls) ── */
-#dpad{position:fixed;bottom:100px;right:16px;display:none;flex-direction:column;align-items:center;gap:4px;z-index:25;touch-action:none}
+#dpad{position:fixed;bottom:100px;left:16px;display:none;flex-direction:column;align-items:center;gap:4px;z-index:25;touch-action:none}
 .dpad-row{display:flex;gap:4px}
 .dpad-btn{width:60px;height:60px;border-radius:12px;background:rgba(255,255,255,.15);border:2px solid rgba(255,255,255,.25);backdrop-filter:blur(10px);color:rgba(255,255,255,.8);font-size:22px;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .1s;-webkit-tap-highlight-color:transparent;touch-action:none;user-select:none;-webkit-user-select:none}
 .dpad-btn:active,.dpad-btn.pressed{background:rgba(255,255,255,.35);color:#fff;border-color:rgba(255,255,255,.6)}
 
 /* ── GAS/BRAKE buttons (left side mobile) ── */
-#mobile-accel{position:fixed;bottom:100px;left:16px;display:none;flex-direction:column;gap:10px;z-index:25;touch-action:none}
+#mobile-accel{position:fixed;bottom:100px;right:16px;display:none;flex-direction:column;gap:10px;z-index:25;touch-action:none}
 .accel-btn{width:70px;height:70px;border-radius:50%;backdrop-filter:blur(10px);color:#fff;font-size:13px;font-weight:600;letter-spacing:.5px;display:flex;align-items:center;justify-content:center;-webkit-tap-highlight-color:transparent;touch-action:none;user-select:none;-webkit-user-select:none;cursor:pointer;border:2px solid;transition:all .1s;flex-direction:column;gap:2px}
 #btn-gas{background:rgba(100,255,160,.15);border-color:rgba(100,255,160,.5);color:#7ef7a0}
 #btn-gas.pressed{background:rgba(100,255,160,.35);border-color:rgba(100,255,160,.9)}
@@ -506,16 +506,40 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
 <div id="mp-lobby">
   <div class="lobby-box">
     <div class="lobby-title">Multiplayer Race</div>
-    <div class="lobby-sub">Race with friends in the same room code</div>
+    <div class="lobby-sub">Race with friends on any device — share the room code!</div>
     <div id="lobby-room-display"></div>
     <div id="mp-status"></div>
     <input class="lobby-input" id="mp-name-input" placeholder="Your racer name..." maxlength="16"/>
-    <input class="lobby-input" id="mp-room-input" placeholder="Room code (blank = create new room)" maxlength="6" style="text-transform:uppercase;letter-spacing:3px"/>
+    <input class="lobby-input" id="mp-room-input" placeholder="Room code (leave blank to create new room)" maxlength="6" style="text-transform:uppercase;letter-spacing:3px"/>
+    <div style="font-size:9px;color:rgba(255,255,255,.25);letter-spacing:.5px;margin-bottom:10px;line-height:1.7">
+      🌐 Cross-device multiplayer via PeerJS WebRTC<br>
+      Create a room → share the 4-letter code → friends enter it to join
+    </div>
     <div><button class="lobby-btn" id="lobby-join-btn">🚀 Start Racing!</button></div>
+    <div id="room-code-share" style="display:none;margin-top:10px">
+      <div style="font-size:10px;color:rgba(0,255,120,.5);letter-spacing:1px;margin-bottom:6px">Share this code with friends:</div>
+      <div style="display:flex;align-items:center;gap:8px;justify-content:center">
+        <div id="share-code-display" style="font-size:22px;font-weight:600;letter-spacing:6px;color:#7ef7a0"></div>
+        <button class="lobby-btn" id="copy-code-btn" style="padding:5px 14px;font-size:10px">📋 Copy</button>
+      </div>
+    </div>
     <div class="lobby-cancel" id="lobby-cancel">✕ Cancel</div>
   </div>
 </div>
 
+<script>
+function acceptCookies(){
+  try{localStorage.setItem('gr_cookie_consent','accepted');}catch(e){}
+  document.getElementById('cookie-banner').classList.add('hidden');
+  if(typeof loadSavedPlaylist==='function') loadSavedPlaylist();
+}
+function declineCookies(){
+  try{localStorage.setItem('gr_cookie_consent','declined');}catch(e){}
+  document.getElementById('cookie-banner').classList.add('hidden');
+}
+function openTerms(){document.getElementById('terms-modal').classList.add('show');}
+function closeTerms(){document.getElementById('terms-modal').classList.remove('show');}
+</script>
 <!-- COOKIE BANNER -->
 <div id="cookie-banner">
   <div class="cookie-text">
@@ -867,12 +891,16 @@ function applyPreset(name){
   saveToLS('gr_scene', name);
 }
 
-// ── ROAD GENERATION ── (smooth, continuous, not jumpy)
+// ── ROAD GENERATION ── (smooth, continuous, with sharp turns)
 const ROAD_W=9,SEG_LEN=10,POOL_SIZE=120,VIEW_SEGS=80;
-const DIFF={gentle:{curveMag:0.012,hillMag:0.6,hillSpd:0.015},rolling:{curveMag:0.032,hillMag:1.4,hillSpd:0.022},hilly:{curveMag:0.068,hillMag:2.8,hillSpd:0.030}};
+const DIFF={
+  gentle:{curveMag:0.018,hillMag:0.7,hillSpd:0.016,curveDur:[50,120],sharpChance:0.05},
+  rolling:{curveMag:0.042,hillMag:1.6,hillSpd:0.024,curveDur:[30,90],sharpChance:0.18},
+  hilly: {curveMag:0.085,hillMag:3.2,hillSpd:0.032,curveDur:[20,70],sharpChance:0.30}
+};
 let diff='gentle';
 let rng=makePRNG(strHash('genzrace2024'));
-const cursor={x:0,y:0,z:0,yaw:0,pitch:0,curveTgt:0,curveNow:0,curveTimer:0,curveInterval:80,hillPhase:0};
+const cursor={x:0,y:0,z:0,yaw:0,pitch:0,curveTgt:0,curveNow:0,curveTimer:0,curveInterval:80,hillPhase:0,banking:0};
 const path=[];
 
 function extendPath(n){
@@ -881,18 +909,24 @@ function extendPath(n){
     cursor.curveTimer++;
     if(cursor.curveTimer>cursor.curveInterval){
       cursor.curveTimer=0;
-      cursor.curveTgt=(rng()-.5)*p.curveMag*2;
-      cursor.curveInterval=35+(rng()*80)|0;
+      // Occasionally spawn a sharp hairpin-style curve
+      const sharp = rng()<p.sharpChance;
+      cursor.curveTgt=(rng()-.5)*p.curveMag*2*(sharp?2.8:1.0);
+      const [dMin,dMax]=p.curveDur;
+      cursor.curveInterval=(dMin+rng()*(dMax-dMin))|0;
+      if(sharp) cursor.curveInterval=Math.max(dMin,(cursor.curveInterval*0.55)|0);
     }
-    cursor.curveNow+=(cursor.curveTgt-cursor.curveNow)*0.045;
+    cursor.curveNow+=(cursor.curveTgt-cursor.curveNow)*0.048;
     cursor.yaw+=cursor.curveNow;
+    // Road banking proportional to curvature
+    cursor.banking=lerp(cursor.banking,cursor.curveNow*18,0.14);
     cursor.hillPhase+=p.hillSpd;
     const tp=Math.sin(cursor.hillPhase)*p.hillMag*0.012;
     cursor.pitch+=(tp-cursor.pitch)*0.12;
     cursor.y+=cursor.pitch*SEG_LEN;
     cursor.x+=Math.sin(cursor.yaw)*SEG_LEN;
     cursor.z-=Math.cos(cursor.yaw)*SEG_LEN;
-    path.push({x:cursor.x,y:cursor.y,z:cursor.z,yaw:cursor.yaw});
+    path.push({x:cursor.x,y:cursor.y,z:cursor.z,yaw:cursor.yaw,banking:cursor.banking,curvature:cursor.curveNow});
   }
 }
 extendPath(250);
@@ -917,6 +951,8 @@ function placeSegment(idx){
   seg.position.set((p.x+pv.x)/2,(p.y+pv.y)/2,(p.z+pv.z)/2);
   seg.rotation.y=-p.yaw;
   seg.rotation.x=Math.atan2(p.y-pv.y,SEG_LEN)*0.55;
+  // Banking tilt on curves
+  seg.rotation.z = clamp((p.banking||0)*0.18,-0.22,0.22);
   seg.userData.pathIdx=idx;
   seg.visible=true;
   segActive.push(seg);
@@ -967,7 +1003,45 @@ function placeDec(pt){
   }
 }
 
-// ── CAR ──
+// ── SKID MARKS ──
+const SKID_MAX=180;
+const skidMat=new THREE.MeshBasicMaterial({color:0x111111,transparent:true,opacity:0.55,depthWrite:false});
+const skidPool=[];const skidActive=[];
+function makeSkidMesh(){
+  const g=new THREE.Mesh(new THREE.PlaneGeometry(0.28,SEG_LEN*0.55),skidMat.clone());
+  g.rotation.x=-Math.PI/2;g.visible=false;scene.add(g);return g;
+}
+for(let i=0;i<SKID_MAX;i++) skidPool.push(makeSkidMesh());
+
+let lastSkidPos=null;
+function addSkidMark(){
+  if(skidPool.length===0){
+    const old=skidActive.shift();if(!old)return;
+    old.visible=false;old.material.opacity=0.55;skidPool.push(old);
+  }
+  const pos=carGroup.position;
+  if(lastSkidPos&&pos.distanceTo(lastSkidPos)<1.8) return;
+  lastSkidPos=pos.clone();
+
+  // Two marks — one per rear wheel
+  [-0.85,0.85].forEach(offset=>{
+    if(skidPool.length===0)return;
+    const sm=skidPool.pop();
+    const angle=state.heading;
+    sm.position.set(
+      pos.x+Math.cos(angle)*offset - Math.sin(angle)*1.4,
+      pos.y+0.02,
+      pos.z-Math.sin(angle)*offset - Math.cos(angle)*1.4
+    );
+    sm.rotation.y=-angle;
+    sm.material.opacity=clamp(state.slipRatio*0.65,0.12,0.55);
+    sm.visible=true;
+    skidActive.push(sm);
+  });
+
+  // Fade old marks
+  skidActive.forEach((s,i)=>{s.material.opacity*=0.997;});
+}
 const carGroup=new THREE.Group();
 const carBodyMat=new THREE.MeshPhongMaterial({color:0xcc2222,shininess:140,specular:0x993333});
 const carBodyLowMat=new THREE.MeshPhongMaterial({color:0xaa1a1a,shininess:80});
@@ -1023,21 +1097,87 @@ whlPos.forEach(([wx,wz])=>{
 });
 scene.add(carGroup);
 
-// ── MULTIPLAYER (BroadcastChannel - works between tabs on same device) ──
+// ── MULTIPLAYER (PeerJS — real cross-device P2P via public STUN/TURN) ──
 const PLAYER_COLORS=['#ff6b6b','#4ecdc4','#45b7d1','#96ceb4','#ffeaa7','#dda0dd','#ff9f43','#74b9ff'];
 const MP={
   active:false,myName:'',myColor:'#7ef7a0',roomId:'',
-  players:{},channel:null,
+  players:{},
   myId:'p_'+Math.random().toString(36).slice(2,8),
+  peer:null,          // PeerJS Peer instance
+  connections:{},     // peerId -> DataConnection
   broadcastInterval:null,
+  hostPeerId:null,    // host's full peer ID (roomCode based)
+  isHost:false,
+  _peerReady:false,
+
+  // Send to all connected peers
   broadcast(d){
-    try{if(this.channel) this.channel.postMessage({...d,id:this.myId,name:this.myName,color:this.myColor});}
-    catch(e){}
+    const msg={...d,id:this.myId,name:this.myName,color:this.myColor};
+    Object.values(this.connections).forEach(conn=>{
+      try{if(conn.open) conn.send(msg);}catch(e){}
+    });
   },
+
+  // Handle incoming data from any peer
+  handleMsg(d){
+    if(!d||!d.id||d.id===this.myId) return;
+    if(d.type==='leave'){
+      if(this.connections[d.id]){try{this.connections[d.id].close();}catch(e){}delete this.connections[d.id];}
+      if(otherMeshes[d.id]) otherMeshes[d.id].visible=false;
+      delete this.players[d.id];
+      updateLB();return;
+    }
+    if(d.type==='join'){
+      // Reply with our own position so they see us immediately
+      const conn=this.connections[d.id];
+      if(conn&&conn.open){
+        try{conn.send({type:'pos',id:this.myId,name:this.myName,color:this.myColor,
+          x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,
+          heading:state.heading,distance:state.distance});}catch(e){}
+      }
+      // Also relay to other connected peers (mesh topology)
+      Object.entries(this.connections).forEach(([pid,c])=>{
+        if(pid!==d.id&&c.open){try{c.send({...d,relayed:true});}catch(e){}}
+      });
+    }
+    if(!otherMeshes[d.id]) otherMeshes[d.id]=makeOtherCar(d.color||'#4ecdc4');
+    this.players[d.id]={name:d.name,color:d.color,distance:d.distance||0,lastSeen:Date.now()};
+    const m=otherMeshes[d.id];
+    if(m&&d.x!==undefined){
+      m.visible=true;
+      m.position.set(d.x,d.y||0,d.z);
+      m.rotation.y=d.heading||0;
+    }
+    updateLB();
+  },
+
+  _setupConn(conn){
+    conn.on('open',()=>{
+      this.connections[conn.peer]=conn;
+      // Announce ourselves
+      conn.send({type:'join',id:this.myId,name:this.myName,color:this.myColor,
+        x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,
+        heading:state.heading,distance:state.distance});
+      setMPStatus('Connected to peer!');
+    });
+    conn.on('data',(d)=>this.handleMsg(d));
+    conn.on('close',()=>{
+      delete this.connections[conn.peer];
+      // Remove ghost car
+      const ghost=Object.values(otherMeshes).find((_,i)=>Object.keys(otherMeshes)[i]===conn.peer);
+      if(otherMeshes[conn.peer]) otherMeshes[conn.peer].visible=false;
+      updateLB();
+    });
+    conn.on('error',(e)=>console.warn('conn err',e));
+  },
+
   leave(){
     if(this.broadcastInterval){clearInterval(this.broadcastInterval);this.broadcastInterval=null;}
-    if(this.channel){try{this.broadcast({type:'leave'});this.channel.close();}catch(e){}}
-    this.active=false;this.players={};this.channel=null;
+    this.broadcast({type:'leave'});
+    Object.values(this.connections).forEach(c=>{try{c.close();}catch(e){}});
+    this.connections={};
+    if(this.peer){try{this.peer.destroy();}catch(e){} this.peer=null;}
+    this.active=false;this.players={};this._peerReady=false;this.isHost=false;
     Object.values(otherMeshes).forEach(m=>{m.visible=false;});
     document.getElementById('mp-badge').classList.remove('show');
     document.getElementById('mp-room-info').classList.remove('show');
@@ -1091,63 +1231,147 @@ function updateAIRacers(dt){
   });
 }
 
+function setMPStatus(msg){ document.getElementById('mp-status').textContent=msg; }
+
 function joinMP(name,room){
   MP.myName=name||'Racer';
-  MP.roomId=room||Math.random().toString(36).slice(2,6).toUpperCase();
   MP.myColor=PLAYER_COLORS[Math.floor(Math.random()*PLAYER_COLORS.length)];
 
-  // Close old channel
-  if(MP.channel){try{MP.channel.close();}catch(e){}}
+  // Clean up old session
+  if(MP.peer){try{MP.peer.destroy();}catch(e){}}
   if(MP.broadcastInterval){clearInterval(MP.broadcastInterval);MP.broadcastInterval=null;}
+  MP.connections={};MP.players={};
 
-  try{
-    MP.channel=new BroadcastChannel('genzrace_'+MP.roomId);
-    MP.channel.onmessage=(e)=>{
-      const d=e.data;
-      if(!d||!d.id||d.id===MP.myId) return;
-      if(d.type==='leave'){
-        if(otherMeshes[d.id]) otherMeshes[d.id].visible=false;
-        delete MP.players[d.id];
-        updateLB();return;
-      }
-      if(!otherMeshes[d.id]) otherMeshes[d.id]=makeOtherCar(d.color||'#4ecdc4');
-      MP.players[d.id]={name:d.name,color:d.color,distance:d.distance||0,lastSeen:Date.now()};
-      const m=otherMeshes[d.id];
-      if(m&&d.x!==undefined){
-        m.visible=true;
-        m.position.set(d.x,d.y||0,d.z);
-        m.rotation.y=d.heading||0;
-      }
-    };
-    // Announce presence
-    setTimeout(()=>MP.broadcast({type:'join'}),200);
-  }catch(e){
-    MP.channel={postMessage:()=>{},close:()=>{}};
+  const isCreating=!room||room.trim()==='';
+  if(isCreating){
+    MP.roomId=Math.random().toString(36).slice(2,6).toUpperCase();
+  } else {
+    MP.roomId=room.trim().toUpperCase();
   }
 
-  // Start AI racers for company
+  // PeerJS peer ID is based on room code + role
+  // Host: "gzrace_<roomId>_host"  Joiner: random
+  const hostPeerId='gzrace_'+MP.roomId+'_h';
+  MP.hostPeerId=hostPeerId;
+
+  setMPStatus(isCreating?'Creating room…':'Connecting to room…');
+
+  // Load PeerJS dynamically if not already loaded
+  function initPeer(){
+    if(isCreating){
+      // Be the host — claim the host peer ID
+      MP.isHost=true;
+      MP.peer=new Peer(hostPeerId,{debug:0});
+      MP.peer.on('open',(id)=>{
+        MP._peerReady=true;
+        setMPStatus('Room ready! Share code: '+MP.roomId);
+        finishJoin();
+      });
+      MP.peer.on('connection',(conn)=>{
+        MP._setupConn(conn);
+        setMPStatus('Player joined!');
+      });
+      MP.peer.on('error',(e)=>{
+        if(e.type==='unavailable-id'){
+          // Host slot taken — join as player instead
+          MP.isHost=false;
+          MP.peer.destroy();
+          startAsJoiner(hostPeerId);
+        } else {
+          setMPStatus('Error: '+e.type+'. Try another room code.');
+        }
+      });
+    } else {
+      startAsJoiner(hostPeerId);
+    }
+  }
+
+  function startAsJoiner(targetId){
+    MP.peer=new Peer(MP.myId,{debug:0});
+    MP.peer.on('open',()=>{
+      MP._peerReady=true;
+      // Connect to host
+      const conn=MP.peer.connect(targetId,{reliable:true,serialization:'json'});
+      MP._setupConn(conn);
+      setMPStatus('Connecting to host…');
+      // Also accept reverse connections from other players
+      MP.peer.on('connection',(c)=>MP._setupConn(c));
+      conn.on('open',()=>finishJoin());
+      conn.on('error',()=>setMPStatus('Could not reach host. Check the room code.'));
+    });
+    MP.peer.on('error',(e)=>setMPStatus('Peer error: '+e.type));
+  }
+
+  function finishJoin(){
+    // Start AI racers for company
+    startAIRacers();
+    MP.active=true;
+
+    document.getElementById('mp-badge').classList.add('show');
+    document.getElementById('btn-mp').classList.add('active');
+
+    const roomInfo=document.getElementById('mp-room-info');
+    roomInfo.textContent='Room: '+MP.roomId+(MP.isHost?' (Host)':' (Joined)');
+    roomInfo.classList.add('show');
+    document.getElementById('lobby-room-display').textContent='Room: '+MP.roomId;
+
+    // Update share code display if visible
+    const scd=document.getElementById('share-code-display');
+    if(scd) scd.textContent=MP.roomId;
+
+    // Position broadcast
+    MP.broadcastInterval=setInterval(()=>{
+      if(!MP.active)return;
+      MP.broadcast({
+        type:'pos',
+        x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,
+        heading:state.heading,distance:state.distance
+      });
+    },100);
+
+    saveToLS('gr_mp_name',MP.myName);
+    updateLB();
+  }
+
+  if(typeof Peer==='undefined'){
+    const s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js';
+    s.onload=initPeer;
+    s.onerror=()=>{
+      setMPStatus('PeerJS CDN failed — trying same-tab fallback…');
+      joinMPFallback(name,room);
+    };
+    document.head.appendChild(s);
+  } else {
+    initPeer();
+  }
+  saveToLS('gr_mp_name',MP.myName);
+}
+
+// Fallback: BroadcastChannel for same-device tabs
+function joinMPFallback(name,room){
+  MP.myName=name||'Racer';
+  const isCreating=!room||room.trim()==='';
+  if(isCreating) MP.roomId=Math.random().toString(36).slice(2,6).toUpperCase();
+  else MP.roomId=room.trim().toUpperCase();
+
+  const channel=new BroadcastChannel('genzrace_'+MP.roomId);
+  MP.connections['_bc']={open:true,send:(d)=>{try{channel.postMessage(d);}catch(e){}}};
+  channel.onmessage=(e)=>MP.handleMsg(e.data);
+
   startAIRacers();
   MP.active=true;
-
   document.getElementById('mp-badge').classList.add('show');
   document.getElementById('btn-mp').classList.add('active');
+  document.getElementById('mp-lobby').classList.remove('show');
+  document.getElementById('mp-room-info').textContent='Room: '+MP.roomId+' (same-device only)';
+  document.getElementById('mp-room-info').classList.add('show');
+  setMPStatus('Connected (local tabs only)');
 
-  const roomInfo=document.getElementById('mp-room-info');
-  roomInfo.textContent='Room: '+MP.roomId+' — Share this code with friends (same device/browser)';
-  roomInfo.classList.add('show');
-
-  document.getElementById('lobby-room-display').textContent='Room: '+MP.roomId;
-
-  // Interval broadcast
   MP.broadcastInterval=setInterval(()=>{
     if(!MP.active)return;
-    MP.broadcast({
-      type:'pos',
-      x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,
-      heading:state.heading,distance:state.distance
-    });
-  },120);
-
+    MP.broadcast({type:'pos',x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,heading:state.heading,distance:state.distance});
+  },100);
   saveToLS('gr_mp_name',MP.myName);
   updateLB();
 }
@@ -1170,10 +1394,21 @@ function updateLB(){
 const state={
   velocity:0,targetSpeed:60,heading:0,steer:0,steerInput:0,
   multiplier:1.0,smoothMult:1.0,pathIdx:2,
-  autopilot:false,  // OFF by default
-  camMode:'chase',running:false,distance:0,wheelRot:0
+  autopilot:false,
+  camMode:'chase',running:false,distance:0,wheelRot:0,
+  // Enhanced physics
+  lateralVel:0,       // sideways sliding velocity
+  grip:1.0,           // 0=full drift, 1=full grip
+  driftAngle:0,       // visual body slip angle
+  weightTransfer:0,   // front/rear load shift on accel/brake
+  turboBoost:0,       // brief boost after sustained accel
+  braking:false,      // is braking hard
+  roadCurvature:0,    // current road curve (for banking camera)
+  slipRatio:0,        // tyre slip ratio (drives skid audio+marks)
+  onRoad:true,        // whether car is on road surface
+  offRoadSlowdown:1.0 // grip reduction when off road
 };
-const camState={pos:new THREE.Vector3(0,4,10),lookAt:new THREE.Vector3(),orbitAngle:0};
+const camState={pos:new THREE.Vector3(0,4,10),lookAt:new THREE.Vector3(),orbitAngle:0,shake:0};
 const keys={up:false,down:false,left:false,right:false};
 
 // ── KEYBOARD ──
@@ -1267,34 +1502,112 @@ function updatePhysics(dt){
   const st=(state.targetSpeed/60)*m;
   if(state.autopilot) updateAP(dt,st);
   else updateManual(dt,st);
-  state.wheelRot+=state.velocity*dt*2.2;
-  wheelMeshes.forEach(w=>{w.rotation.x=state.wheelRot;});
-  const sv=state.steer*.5;
-  wheelMeshes[0].rotation.y=sv;wheelMeshes[1].rotation.y=sv;
-  carGroup.rotation.z=-state.steer*.35;
+
+  // Wheel spin
+  state.wheelRot+=state.velocity*dt*2.8;
+  wheelMeshes.forEach(w=>{ w.rotation.x=state.wheelRot; });
+
+  // Front wheel steering angle
+  const sv=clamp(state.steer*0.55,-0.55,0.55);
+  wheelMeshes[0].rotation.y=sv; wheelMeshes[1].rotation.y=sv;
+
+  // Body roll from lateral forces
+  const lateralG = state.steer * Math.abs(state.velocity) * 0.18;
+  carGroup.rotation.z = lerp(carGroup.rotation.z, -lateralG * 0.38, Math.min(1,dt*6));
+
+  // Drift body angle (visual slip)
+  carGroup.rotation.y = state.heading + state.driftAngle * 0.6;
+
+  // Nose dip/rise on brake/accel (weight transfer)
+  const pitchTarget = state.weightTransfer * 0.04;
+  carGroup.rotation.x = lerp(carGroup.rotation.x, pitchTarget, Math.min(1,dt*5));
+
+  // Road height tracking
   const cp=getPt(state.pathIdx);
-  if(cp) carGroup.position.y=lerp(carGroup.position.y,cp.y+.36,Math.min(1,dt*7));
+  if(cp) carGroup.position.y=lerp(carGroup.position.y,cp.y+.36,Math.min(1,dt*8));
+
   state.distance+=Math.abs(state.velocity)*dt*3.6*.001;
+
+  // Skid marks when slipping
+  if(state.slipRatio>0.25 && !state.autopilot) addSkidMark();
+
+  // Camera shake on hard braking
+  if(state.braking && Math.abs(state.velocity)>0.5) camState.shake=lerp(camState.shake,0.06,0.3);
+  else camState.shake=lerp(camState.shake,0,0.12);
+
   const normVel=clamp(Math.abs(state.velocity)/Math.max(.3,state.smoothMult),0,1);
   updateEngineSFX(normVel,state.steer);
 }
 
 function updateManual(dt,st){
-  if(keys.up) state.velocity=lerp(state.velocity,st,Math.min(1,dt*2.5));
-  else if(keys.down) state.velocity=lerp(state.velocity,-st*.35,Math.min(1,dt*3));
-  else state.velocity=lerp(state.velocity,st*.45,Math.min(1,dt*1.2));
+  const spd=Math.abs(state.velocity);
+  const speedFactor=clamp(spd/Math.max(0.3,st),0,1);
 
-  const sm=.038/Math.max(.3,state.smoothMult);
-  if(keys.left) state.steerInput=-sm;
-  else if(keys.right) state.steerInput=sm;
-  else state.steerInput*=.78;
+  // ── ACCELERATION / BRAKING ──
+  if(keys.up){
+    const accelForce = state.grip * (state.turboBoost>0 ? 1.18 : 1.0);
+    state.velocity=lerp(state.velocity, st*accelForce, Math.min(1,dt*2.8));
+    state.weightTransfer=lerp(state.weightTransfer,-1,Math.min(1,dt*4));
+    state.braking=false;
+    state.turboBoost=Math.max(0,state.turboBoost-dt);
+  } else if(keys.down){
+    const brakePower = spd>0.05 ? -st*0.55 : 0;
+    state.velocity=lerp(state.velocity, brakePower, Math.min(1,dt*4.5));
+    state.weightTransfer=lerp(state.weightTransfer,1,Math.min(1,dt*5));
+    state.braking=spd>0.25;
+  } else {
+    // Coasting — gentle decel
+    state.velocity=lerp(state.velocity, st*0.38, Math.min(1,dt*1.1));
+    state.weightTransfer=lerp(state.weightTransfer,0,Math.min(1,dt*3));
+    state.braking=false;
+  }
 
-  state.steer=lerp(state.steer,state.steerInput,.28);
-  state.heading+=state.steer*state.velocity*dt*6.5;
-  carGroup.position.x+=Math.sin(state.heading)*state.velocity*dt*3.6;
-  carGroup.position.z-=Math.cos(state.heading)*state.velocity*dt*3.6;
-  carGroup.rotation.y=state.heading;
+  // ── STEERING — speed-sensitive, tighter at low speed ──
+  const steerMax = 0.048 * (1.0 - speedFactor*0.42) / Math.max(0.3,state.smoothMult);
+  const steerResponse = keys.left||keys.right ? (0.18 + (1-speedFactor)*0.22) : 0;
+
+  if(keys.left)  state.steerInput = lerp(state.steerInput,-steerMax,Math.min(1,dt*14*steerResponse+dt*6));
+  else if(keys.right) state.steerInput = lerp(state.steerInput,steerMax,Math.min(1,dt*14*steerResponse+dt*6));
+  else state.steerInput *= (1 - dt*9);
+
+  state.steerInput = clamp(state.steerInput,-steerMax,steerMax);
+
+  // ── GRIP / DRIFT MODEL ──
+  const steerMag = Math.abs(state.steerInput);
+  const latForce = steerMag * speedFactor;
+  // Tyre grip degrades at high lateral force
+  const gripTarget = clamp(1.0 - latForce*8.5 + (keys.up?0.15:0), 0.18, 1.0);
+  state.grip = lerp(state.grip, gripTarget, Math.min(1,dt*5));
+
+  // Lateral velocity (sliding)
+  const latAccel = state.steerInput * state.velocity * 5.5 * (1-state.grip*0.72);
+  state.lateralVel = lerp(state.lateralVel, latAccel, Math.min(1,dt*(state.grip*4+1)));
+  state.lateralVel *= (1 - dt * (state.grip*3+0.5));
+
+  // Slip ratio for skids
+  state.slipRatio = clamp(Math.abs(state.lateralVel)*0.8 + (state.braking?spd*0.4:0), 0, 1);
+
+  // Drift angle — body lag behind heading
+  const driftTarget = state.lateralVel * 0.22;
+  state.driftAngle = lerp(state.driftAngle, driftTarget, Math.min(1,dt*3.5));
+
+  // ── HEADING UPDATE ──
+  state.steer = lerp(state.steer, state.steerInput, 0.28);
+  // Heading turns less when drifting
+  const yawRate = state.steer * state.velocity * dt * (5.5 + state.grip*1.8);
+  state.heading += yawRate;
+
+  // ── POSITION ──
+  const latRight = state.heading + Math.PI/2;
+  carGroup.position.x += Math.sin(state.heading)*state.velocity*dt*3.6 + Math.sin(latRight)*state.lateralVel*dt*0.5;
+  carGroup.position.z -= Math.cos(state.heading)*state.velocity*dt*3.6 + Math.cos(latRight)*state.lateralVel*dt*0.5;
+
   state.pathIdx=closestIdx(carGroup.position.x,carGroup.position.z,state.pathIdx);
+
+  // Road curvature lookahead for camera banking
+  const aheadPt=getPt(state.pathIdx+8);
+  const nowPt=getPt(state.pathIdx);
+  if(aheadPt&&nowPt) state.roadCurvature=lerp(state.roadCurvature,(aheadPt.yaw-nowPt.yaw)*6,Math.min(1,dt*3));
 }
 
 function updateAP(dt,st){
@@ -1305,27 +1618,42 @@ function updateAP(dt,st){
   const tgt=Math.atan2(dx,-dz);let diff=tgt-state.heading;
   while(diff>Math.PI)diff-=Math.PI*2;while(diff<-Math.PI)diff+=Math.PI*2;
   state.heading+=diff*Math.min(1,dt*4.5);state.steer=diff*.25;
+  state.driftAngle=lerp(state.driftAngle,0,dt*5);
   carGroup.position.x+=Math.sin(state.heading)*state.velocity*dt*3.6;
   carGroup.position.z-=Math.cos(state.heading)*state.velocity*dt*3.6;
   carGroup.rotation.y=state.heading;
+  state.roadCurvature=lerp(state.roadCurvature,diff*4,Math.min(1,dt*3));
 }
 
 function updateCamera(dt){
   const cp=carGroup.position,ch=state.heading,cs=4+state.smoothMult*.6;
+  const shakeX=(Math.random()-.5)*camState.shake;
+  const shakeY=Math.abs(Math.random()-.5)*camState.shake;
   if(state.camMode==='chase'){
-    const d=8+state.smoothMult*1.2,h=3.2;
+    const d=8+state.smoothMult*1.4,h=3.2;
+    // Banking effect on curves
+    const bankTarget = state.roadCurvature * 0.055 + state.driftAngle*0.04;
     camState.pos.lerp(new THREE.Vector3(cp.x-Math.sin(ch)*d,cp.y+h,cp.z+Math.cos(ch)*d),Math.min(1,dt*cs));
     camState.lookAt.set(cp.x+Math.sin(ch)*5,cp.y+.8,cp.z-Math.cos(ch)*5);
-    camera.position.copy(camState.pos);camera.lookAt(camState.lookAt);
+    camera.position.copy(camState.pos);
+    camera.position.x+=shakeX; camera.position.y+=shakeY;
+    camera.lookAt(camState.lookAt);
+    camera.rotation.z=lerp(camera.rotation.z, bankTarget, Math.min(1,dt*3.5));
   } else if(state.camMode==='driver'){
-    camState.pos.lerp(new THREE.Vector3(cp.x+Math.sin(ch)*.5,cp.y+1.25,cp.z-Math.cos(ch)*.5),Math.min(1,dt*14));
+    // Slight head bob
+    const bob=Math.sin(state.wheelRot*1.1)*0.012*clamp(Math.abs(state.velocity)*0.5,0,1);
+    camState.pos.lerp(new THREE.Vector3(cp.x+Math.sin(ch)*.5,cp.y+1.25+bob,cp.z-Math.cos(ch)*.5),Math.min(1,dt*14));
     camState.lookAt.set(cp.x+Math.sin(ch)*30,cp.y+1,cp.z-Math.cos(ch)*30);
-    camera.position.copy(camState.pos);camera.lookAt(camState.lookAt);
+    camera.position.copy(camState.pos);
+    camera.position.x+=shakeX*0.5;
+    camera.lookAt(camState.lookAt);
+    camera.rotation.z=lerp(camera.rotation.z, -state.driftAngle*0.15, Math.min(1,dt*4));
   } else {
     camState.orbitAngle+=dt*.22;
     const r=14,oh=5.5+Math.sin(camState.orbitAngle*.4)*1.5;
     camState.pos.lerp(new THREE.Vector3(cp.x+Math.cos(camState.orbitAngle)*r,cp.y+oh,cp.z+Math.sin(camState.orbitAngle)*r),Math.min(1,dt*2.5));
     camera.position.copy(camState.pos);camera.lookAt(cp.x,cp.y+.5,cp.z);
+    camera.rotation.z=0;
   }
 }
 
@@ -1499,16 +1827,39 @@ document.getElementById('lobby-cancel').addEventListener('click',()=>{
 document.getElementById('lobby-join-btn').addEventListener('click',()=>{
   const name=document.getElementById('mp-name-input').value.trim()||'Racer';
   const room=document.getElementById('mp-room-input').value.trim().toUpperCase();
-  document.getElementById('mp-status').textContent='Joining room...';
-  setTimeout(()=>{
-    joinMP(name,room);
-    closeLobby();
-    if(!state.running){
-      state.running=true;
-      state.autopilot=false;
-    }
-    updateLB();
-  },300);
+  document.getElementById('mp-status').textContent='Connecting…';
+  if(!state.running){
+    state.running=true;
+    state.autopilot=false;
+    document.getElementById('intro').classList.add('fade');
+    setTimeout(()=>document.getElementById('intro').style.display='none',900);
+  }
+  joinMP(name,room);
+  // Show room code share UI once room is created
+  const isCreating=!room;
+  if(isCreating){
+    document.getElementById('room-code-share').style.display='block';
+    document.getElementById('share-code-display').textContent='…';
+    // Will be updated by setMPStatus
+    const obs=new MutationObserver(()=>{
+      if(MP.roomId) document.getElementById('share-code-display').textContent=MP.roomId;
+    });
+    obs.observe(document.getElementById('mp-status'),{childList:true,characterData:true,subtree:true});
+    setTimeout(()=>{ if(MP.roomId) document.getElementById('share-code-display').textContent=MP.roomId; obs.disconnect(); },3000);
+  }
+  updateLB();
+});
+
+// Copy room code to clipboard
+document.getElementById('copy-code-btn').addEventListener('click',()=>{
+  const code=MP.roomId;
+  if(!code) return;
+  navigator.clipboard.writeText(code).then(()=>{
+    document.getElementById('copy-code-btn').textContent='✅ Copied!';
+    setTimeout(()=>document.getElementById('copy-code-btn').textContent='📋 Copy',2000);
+  }).catch(()=>{
+    prompt('Copy this room code:',code);
+  });
 });
 
 document.getElementById('btn-mp').addEventListener('click',()=>{
@@ -1619,23 +1970,12 @@ document.querySelectorAll('.ctrl-opt').forEach(opt=>{
 document.getElementById('toggle-dpad-pc').addEventListener('change',e=>{
   const dpad=document.getElementById('dpad');const accel=document.getElementById('mobile-accel');
   if(e.target.checked){dpad.style.display='flex';accel.style.display='flex';}
-  else{dpad.style.display='';accel.style.display='';}
+  else{dpad.style.display='none';accel.style.display='none';}
 });
 
-// Quality
-document.querySelectorAll('[data-quality]').forEach(p=>p.addEventListener('click',()=>{
-  document.querySelectorAll('[data-quality]').forEach(x=>x.classList.remove('active'));
-  p.classList.add('active');
-  const q=p.dataset.quality;
-  renderer.setPixelRatio(q==='low'?1:q==='med'?Math.min(window.devicePixelRatio,1.5):Math.min(window.devicePixelRatio,2));
-  renderer.shadowMap.enabled=q!=='low';
-}));
-
-// Init music player
-musicPlayer.init();
-
-// Start render loop
+// start render loop
 loop();
+
 </script>
 </body>
 </html>
