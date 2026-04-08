@@ -628,7 +628,7 @@ function closeTerms(){ document.getElementById('terms-modal').classList.remove('
 document.getElementById('terms-modal').addEventListener('click', e=>{ if(e.target===e.currentTarget) closeTerms(); });
 document.getElementById('open-terms-btn').addEventListener('click', openTerms);
 checkCookieConsent();
-if(cookiesAccepted) loadSavedPlaylistLater();
+if(cookiesAccepted) setTimeout(loadSavedPlaylist,100);
 
 function saveToLS(key, val){
   if(!cookiesAccepted) return;
@@ -649,7 +649,11 @@ const SFX={engineGain:null,windGain:null,engineOsc:null,windOsc:null,tyreGain:nu
 let sfxSettings={engineVol:0.08,windVol:0.08,tyreEnabled:true,musicVol:0.70,duckEngine:true};
 
 function initAudio(){
-  if(audioCtx)return;
+  if(audioCtx) {
+    // Resume if suspended (browser autoplay policy)
+    if(audioCtx.state==='suspended') audioCtx.resume();
+    return;
+  }
   try{
     audioCtx=new AudioCtx();
     SFX.masterGain=audioCtx.createGain();SFX.masterGain.gain.value=1;SFX.masterGain.connect(audioCtx.destination);
@@ -678,17 +682,14 @@ function initAudio(){
     const tyreFilter=audioCtx.createBiquadFilter();tyreFilter.type='highpass';tyreFilter.frequency.value=200;
     tyreOsc.connect(tyreFilter);tyreFilter.connect(SFX.tyreGain);SFX.tyreGain.connect(SFX.masterGain);
 
-    // Music gain
-    SFX.musicGain=audioCtx.createGain();SFX.musicGain.gain.value=sfxSettings.musicVol;SFX.musicGain.connect(SFX.masterGain);
+    // Music gain node — audio element plays directly, volume controlled via this gain
+    SFX.musicGain=audioCtx.createGain();
+    SFX.musicGain.gain.value=sfxSettings.musicVol;
+    SFX.musicGain.connect(SFX.masterGain);
 
-    // Hook music player source if track loaded
-    if(musicPlayer.audio && !musicPlayer._srcConnected){
-      try{
-        const src=audioCtx.createMediaElementSource(musicPlayer.audio);
-        src.connect(SFX.musicGain);
-        musicPlayer._srcConnected=true;
-      }catch(e){}
-    }
+    // Connect music element to Web Audio if a track is loaded
+    musicPlayer._connectToAudioCtx();
+
   }catch(e){console.warn('Audio init failed',e);}
 }
 
@@ -706,116 +707,237 @@ function updateEngineSFX(speed,steer){
   }
 }
 
-// ── MUSIC PLAYER ── with localStorage playlist persistence
-const musicPlayer={
-  tracks:[],currentIdx:0,audio:null,isPlaying:false,shuffle:false,loop:false,_srcConnected:false,
-  init(){
-    this.audio=new Audio();
-    this.audio.crossOrigin='anonymous';
-    this.audio.volume=sfxSettings.musicVol;
-    this.audio.addEventListener('ended',()=>this.next());
-    this.audio.addEventListener('timeupdate',()=>this.updateProgress());
-    this.audio.addEventListener('loadedmetadata',()=>this.updateDuration());
+// ── MUSIC PLAYER ──
+// Uses in-memory blob URLs for current session (temp storage).
+// Track blobs are kept in memory so you don't need to re-upload within the same session.
+// Track names are saved to localStorage so user sees their list on return.
+const musicPlayer = {
+  tracks: [],          // [{name, url, blob}]
+  currentIdx: 0,
+  audio: null,
+  isPlaying: false,
+  shuffle: false,
+  loop: false,
+  _srcConnected: false,
+  _mediaSource: null,
+
+  init() {
+    this.audio = new Audio();
+    // Do NOT set crossOrigin — blob URLs don't need it and it can break playback
+    this.audio.preload = 'metadata';
+    this.audio.addEventListener('ended', () => this.next());
+    this.audio.addEventListener('timeupdate', () => this.updateProgress());
+    this.audio.addEventListener('loadedmetadata', () => this.updateDuration());
+    this.audio.addEventListener('error', (e) => {
+      console.warn('Audio error:', e);
+      document.getElementById('music-artist').textContent = 'Error loading track';
+    });
+    // Keep volume in sync via audio.volume (Web Audio takes over if connected)
+    this.audio.volume = sfxSettings.musicVol;
   },
-  addFiles(files){
-    const newFiles=Array.from(files);
-    newFiles.forEach(f=>{
-      const url=URL.createObjectURL(f);
-      // Store in memory with IndexedDB fallback via blob url
-      this.tracks.push({name:f.name.replace(/\.[^.]+$/,''),url,blob:f});
+
+  // Connect the audio element to Web Audio API (called after initAudio)
+  _connectToAudioCtx() {
+    if (this._srcConnected || !audioCtx || !this.audio) return;
+    try {
+      this._mediaSource = audioCtx.createMediaElementSource(this.audio);
+      this._mediaSource.connect(SFX.musicGain);
+      this._srcConnected = true;
+    } catch(e) {
+      console.warn('Could not connect music to Web Audio:', e);
+    }
+  },
+
+  addFiles(files) {
+    const newFiles = Array.from(files);
+    const wasEmpty = this.tracks.length === 0;
+    newFiles.forEach(f => {
+      // Check if already in session (avoid duplicates by name)
+      const exists = this.tracks.find(t => t.name === f.name.replace(/\.[^.]+$/, ''));
+      if (!exists) {
+        const url = URL.createObjectURL(f);
+        this.tracks.push({ name: f.name.replace(/\.[^.]+$/, ''), url, blob: f });
+      }
     });
     this.savePlaylistMeta();
     this.renderPlaylist();
-    if(this.tracks.length===newFiles.length) this.loadTrack(0);
+    // Auto-load first track if nothing was loaded before
+    if (wasEmpty && this.tracks.length > 0) {
+      this.loadTrack(0);
+    }
   },
-  savePlaylistMeta(){
-    // Save track names to localStorage (not blobs - those stay in memory)
-    const meta=this.tracks.map(t=>({name:t.name}));
+
+  savePlaylistMeta() {
+    const meta = this.tracks.map(t => ({ name: t.name }));
     saveToLS('gr_playlist_meta', JSON.stringify(meta));
   },
-  loadTrack(idx){
-    if(!this.tracks[idx])return;
-    this.currentIdx=idx;
-    this.audio.src=this.tracks[idx].url;
+
+  loadTrack(idx) {
+    if (!this.tracks[idx]) return;
+    this.currentIdx = idx;
+    const track = this.tracks[idx];
+
+    // Set src directly — blob URL works without crossOrigin
+    this.audio.src = track.url;
     this.audio.load();
-    document.getElementById('music-track-name').textContent=this.tracks[idx].name;
-    document.getElementById('music-artist').textContent='Local file';
-    saveToLS('gr_last_track', idx+'');
+
+    document.getElementById('music-track-name').textContent = track.name;
+    document.getElementById('music-artist').textContent = 'Local file · Session storage';
+    document.getElementById('music-progress-fill').style.width = '0%';
+    document.getElementById('music-current').textContent = '0:00';
+
+    saveToLS('gr_last_track', idx + '');
     this.renderPlaylist();
-    showNowPlaying(this.tracks[idx].name);
-    if(this.isPlaying) this.audio.play().catch(()=>{});
+    showNowPlaying(track.name);
+
+    if (this.isPlaying) {
+      this.audio.play().catch(err => {
+        console.warn('Autoplay blocked:', err);
+        document.getElementById('btn-play-pause').textContent = '▶';
+        this.isPlaying = false;
+      });
+    }
   },
-  play(){
-    if(!this.tracks.length)return;
+
+  play() {
+    if (!this.tracks.length) return;
+    // Must init audio context on user gesture
     initAudio();
-    if(!this.audio.src&&this.tracks[0])this.audio.src=this.tracks[0].url;
-    this.audio.play().catch(()=>{});
-    this.isPlaying=true;
-    document.getElementById('btn-play-pause').textContent='⏸';
-    document.getElementById('btn-music').classList.add('active');
+    // Connect to Web Audio after context is ready
+    this._connectToAudioCtx();
+
+    if (!this.audio.src && this.tracks[0]) {
+      this.audio.src = this.tracks[0].url;
+      this.audio.load();
+    }
+
+    const playPromise = this.audio.play();
+    if (playPromise !== undefined) {
+      playPromise.then(() => {
+        this.isPlaying = true;
+        document.getElementById('btn-play-pause').textContent = '⏸';
+        document.getElementById('btn-music').classList.add('active');
+      }).catch(err => {
+        console.warn('Play failed:', err);
+        this.isPlaying = false;
+        document.getElementById('btn-play-pause').textContent = '▶';
+      });
+    } else {
+      this.isPlaying = true;
+      document.getElementById('btn-play-pause').textContent = '⏸';
+      document.getElementById('btn-music').classList.add('active');
+    }
   },
-  pause(){
+
+  pause() {
     this.audio.pause();
-    this.isPlaying=false;
-    document.getElementById('btn-play-pause').textContent='▶';
+    this.isPlaying = false;
+    document.getElementById('btn-play-pause').textContent = '▶';
     document.getElementById('btn-music').classList.remove('active');
   },
-  togglePlay(){if(this.isPlaying)this.pause();else this.play();},
-  next(){
-    if(!this.tracks.length)return;
-    let idx=this.shuffle?Math.floor(Math.random()*this.tracks.length):(this.currentIdx+1)%this.tracks.length;
-    if(this.loop&&idx===0&&!this.shuffle){this.audio.currentTime=0;this.audio.play().catch(()=>{});return;}
-    this.loadTrack(idx);if(this.isPlaying)this.audio.play().catch(()=>{});
+
+  togglePlay() {
+    if (this.isPlaying) this.pause();
+    else this.play();
   },
-  prev(){
-    if(!this.tracks.length)return;
-    let idx=(this.currentIdx-1+this.tracks.length)%this.tracks.length;
-    this.loadTrack(idx);if(this.isPlaying)this.audio.play().catch(()=>{});
+
+  next() {
+    if (!this.tracks.length) return;
+    let idx = this.shuffle
+      ? Math.floor(Math.random() * this.tracks.length)
+      : (this.currentIdx + 1) % this.tracks.length;
+    if (this.loop && !this.shuffle && idx === 0) {
+      this.audio.currentTime = 0;
+      this.audio.play().catch(() => {});
+      return;
+    }
+    this.loadTrack(idx);
+    if (this.isPlaying) this.audio.play().catch(() => {});
   },
-  setVolume(v){
-    sfxSettings.musicVol=v;
-    if(audioCtx&&SFX.musicGain) SFX.musicGain.gain.setTargetAtTime(v,audioCtx.currentTime,.05);
-    else if(this.audio) this.audio.volume=v;
+
+  prev() {
+    if (!this.tracks.length) return;
+    // If more than 3s in, restart current; else go to prev
+    if (this.audio.currentTime > 3) {
+      this.audio.currentTime = 0;
+      return;
+    }
+    const idx = (this.currentIdx - 1 + this.tracks.length) % this.tracks.length;
+    this.loadTrack(idx);
+    if (this.isPlaying) this.audio.play().catch(() => {});
   },
-  updateProgress(){
-    if(!this.audio.duration)return;
-    const pct=(this.audio.currentTime/this.audio.duration)*100;
-    document.getElementById('music-progress-fill').style.width=pct+'%';
-    document.getElementById('music-current').textContent=fmtTime(this.audio.currentTime);
+
+  setVolume(v) {
+    sfxSettings.musicVol = v;
+    if (audioCtx && SFX.musicGain) {
+      SFX.musicGain.gain.setTargetAtTime(v, audioCtx.currentTime, .05);
+    }
+    // Also set audio.volume as fallback (before Web Audio connected)
+    if (this.audio) this.audio.volume = v;
   },
-  updateDuration(){document.getElementById('music-duration').textContent=fmtTime(this.audio.duration||0);},
-  renderPlaylist(){
-    const pl=document.getElementById('music-playlist');
-    pl.innerHTML=this.tracks.map((t,i)=>`<div class="playlist-item${i===this.currentIdx?' active':''}" data-idx="${i}"><div class="playlist-item-dot"></div>${t.name}</div>`).join('');
-    pl.querySelectorAll('.playlist-item').forEach(el=>{
-      el.addEventListener('click',()=>{this.loadTrack(+el.dataset.idx);if(this.isPlaying)this.audio.play().catch(()=>{});});
+
+  updateProgress() {
+    if (!this.audio || !this.audio.duration) return;
+    const pct = (this.audio.currentTime / this.audio.duration) * 100;
+    document.getElementById('music-progress-fill').style.width = pct + '%';
+    document.getElementById('music-current').textContent = fmtTime(this.audio.currentTime);
+  },
+
+  updateDuration() {
+    document.getElementById('music-duration').textContent = fmtTime(this.audio.duration || 0);
+  },
+
+  renderPlaylist() {
+    const pl = document.getElementById('music-playlist');
+    if (!this.tracks.length) {
+      pl.innerHTML = '<div style="font-size:10px;color:rgba(255,255,255,.2);padding:4px 8px">No tracks loaded</div>';
+      return;
+    }
+    pl.innerHTML = this.tracks.map((t, i) =>
+      `<div class="playlist-item${i === this.currentIdx ? ' active' : ''}" data-idx="${i}">
+        <div class="playlist-item-dot"></div>${t.name}
+      </div>`
+    ).join('');
+    pl.querySelectorAll('.playlist-item').forEach(el => {
+      el.addEventListener('click', () => {
+        this.loadTrack(+el.dataset.idx);
+        if (this.isPlaying) this.audio.play().catch(() => {});
+        else this.play();
+      });
     });
   }
 };
-function fmtTime(s){s=Math.floor(s||0);return Math.floor(s/60)+':'+(s%60+'').padStart(2,'0');}
 
-// Load saved playlist names (just names shown, blobs need re-upload)
-function loadSavedPlaylist(){
-  const meta=getFromLS('gr_playlist_meta');
-  if(meta){
-    try{
-      const items=JSON.parse(meta);
-      if(items&&items.length){
-        // Show placeholder names, user must re-upload files each session (blobs can't be persisted)
-        // But we can show them the list of previously added tracks
-        document.getElementById('music-artist').textContent='Re-upload your tracks to continue';
+function fmtTime(s) {
+  s = Math.floor(s || 0);
+  return Math.floor(s / 60) + ':' + (s % 60 + '').padStart(2, '0');
+}
+
+// Load saved playlist track names (blobs can't be persisted — show placeholder)
+function loadSavedPlaylist() {
+  const meta = getFromLS('gr_playlist_meta');
+  if (meta) {
+    try {
+      const items = JSON.parse(meta);
+      if (items && items.length) {
+        document.getElementById('music-artist').textContent = 'Re-upload your tracks to continue';
+        document.getElementById('music-track-name').textContent = items[0]?.name || 'Previous session tracks';
       }
-    }catch(e){}
+    } catch(e) {}
   }
 }
-function loadSavedPlaylistLater(){ setTimeout(loadSavedPlaylist,100); }
 
 let npTimeout;
-function showNowPlaying(name){
-  const el=document.getElementById('now-playing');
-  el.textContent='♫ '+name;el.classList.add('show');
-  clearTimeout(npTimeout);npTimeout=setTimeout(()=>el.classList.remove('show'),4000);
+function showNowPlaying(name) {
+  const el = document.getElementById('now-playing');
+  el.textContent = '♫ ' + name;
+  el.classList.add('show');
+  clearTimeout(npTimeout);
+  npTimeout = setTimeout(() => el.classList.remove('show'), 4000);
 }
+
+// Init music player
+musicPlayer.init();
 
 // ── THREE.JS SCENE ──
 const PRESETS={
@@ -909,7 +1031,6 @@ function extendPath(n){
     cursor.curveTimer++;
     if(cursor.curveTimer>cursor.curveInterval){
       cursor.curveTimer=0;
-      // Occasionally spawn a sharp hairpin-style curve
       const sharp = rng()<p.sharpChance;
       cursor.curveTgt=(rng()-.5)*p.curveMag*2*(sharp?2.8:1.0);
       const [dMin,dMax]=p.curveDur;
@@ -918,7 +1039,6 @@ function extendPath(n){
     }
     cursor.curveNow+=(cursor.curveTgt-cursor.curveNow)*0.048;
     cursor.yaw+=cursor.curveNow;
-    // Road banking proportional to curvature
     cursor.banking=lerp(cursor.banking,cursor.curveNow*18,0.14);
     cursor.hillPhase+=p.hillSpd;
     const tp=Math.sin(cursor.hillPhase)*p.hillMag*0.012;
@@ -951,7 +1071,6 @@ function placeSegment(idx){
   seg.position.set((p.x+pv.x)/2,(p.y+pv.y)/2,(p.z+pv.z)/2);
   seg.rotation.y=-p.yaw;
   seg.rotation.x=Math.atan2(p.y-pv.y,SEG_LEN)*0.55;
-  // Banking tilt on curves
   seg.rotation.z = clamp((p.banking||0)*0.18,-0.22,0.22);
   seg.userData.pathIdx=idx;
   seg.visible=true;
@@ -1023,7 +1142,6 @@ function addSkidMark(){
   if(lastSkidPos&&pos.distanceTo(lastSkidPos)<1.8) return;
   lastSkidPos=pos.clone();
 
-  // Two marks — one per rear wheel
   [-0.85,0.85].forEach(offset=>{
     if(skidPool.length===0)return;
     const sm=skidPool.pop();
@@ -1039,7 +1157,6 @@ function addSkidMark(){
     skidActive.push(sm);
   });
 
-  // Fade old marks
   skidActive.forEach((s,i)=>{s.material.opacity*=0.997;});
 }
 const carGroup=new THREE.Group();
@@ -1103,14 +1220,13 @@ const MP={
   active:false,myName:'',myColor:'#7ef7a0',roomId:'',
   players:{},
   myId:'p_'+Math.random().toString(36).slice(2,8),
-  peer:null,          // PeerJS Peer instance
-  connections:{},     // peerId -> DataConnection
+  peer:null,
+  connections:{},
   broadcastInterval:null,
-  hostPeerId:null,    // host's full peer ID (roomCode based)
+  hostPeerId:null,
   isHost:false,
   _peerReady:false,
 
-  // Send to all connected peers
   broadcast(d){
     const msg={...d,id:this.myId,name:this.myName,color:this.myColor};
     Object.values(this.connections).forEach(conn=>{
@@ -1118,7 +1234,6 @@ const MP={
     });
   },
 
-  // Handle incoming data from any peer
   handleMsg(d){
     if(!d||!d.id||d.id===this.myId) return;
     if(d.type==='leave'){
@@ -1128,14 +1243,12 @@ const MP={
       updateLB();return;
     }
     if(d.type==='join'){
-      // Reply with our own position so they see us immediately
       const conn=this.connections[d.id];
       if(conn&&conn.open){
         try{conn.send({type:'pos',id:this.myId,name:this.myName,color:this.myColor,
           x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,
           heading:state.heading,distance:state.distance});}catch(e){}
       }
-      // Also relay to other connected peers (mesh topology)
       Object.entries(this.connections).forEach(([pid,c])=>{
         if(pid!==d.id&&c.open){try{c.send({...d,relayed:true});}catch(e){}}
       });
@@ -1154,7 +1267,6 @@ const MP={
   _setupConn(conn){
     conn.on('open',()=>{
       this.connections[conn.peer]=conn;
-      // Announce ourselves
       conn.send({type:'join',id:this.myId,name:this.myName,color:this.myColor,
         x:carGroup.position.x,y:carGroup.position.y,z:carGroup.position.z,
         heading:state.heading,distance:state.distance});
@@ -1163,8 +1275,6 @@ const MP={
     conn.on('data',(d)=>this.handleMsg(d));
     conn.on('close',()=>{
       delete this.connections[conn.peer];
-      // Remove ghost car
-      const ghost=Object.values(otherMeshes).find((_,i)=>Object.keys(otherMeshes)[i]===conn.peer);
       if(otherMeshes[conn.peer]) otherMeshes[conn.peer].visible=false;
       updateLB();
     });
@@ -1237,7 +1347,6 @@ function joinMP(name,room){
   MP.myName=name||'Racer';
   MP.myColor=PLAYER_COLORS[Math.floor(Math.random()*PLAYER_COLORS.length)];
 
-  // Clean up old session
   if(MP.peer){try{MP.peer.destroy();}catch(e){}}
   if(MP.broadcastInterval){clearInterval(MP.broadcastInterval);MP.broadcastInterval=null;}
   MP.connections={};MP.players={};
@@ -1249,17 +1358,13 @@ function joinMP(name,room){
     MP.roomId=room.trim().toUpperCase();
   }
 
-  // PeerJS peer ID is based on room code + role
-  // Host: "gzrace_<roomId>_host"  Joiner: random
   const hostPeerId='gzrace_'+MP.roomId+'_h';
   MP.hostPeerId=hostPeerId;
 
   setMPStatus(isCreating?'Creating room…':'Connecting to room…');
 
-  // Load PeerJS dynamically if not already loaded
   function initPeer(){
     if(isCreating){
-      // Be the host — claim the host peer ID
       MP.isHost=true;
       MP.peer=new Peer(hostPeerId,{debug:0});
       MP.peer.on('open',(id)=>{
@@ -1273,7 +1378,6 @@ function joinMP(name,room){
       });
       MP.peer.on('error',(e)=>{
         if(e.type==='unavailable-id'){
-          // Host slot taken — join as player instead
           MP.isHost=false;
           MP.peer.destroy();
           startAsJoiner(hostPeerId);
@@ -1290,11 +1394,9 @@ function joinMP(name,room){
     MP.peer=new Peer(MP.myId,{debug:0});
     MP.peer.on('open',()=>{
       MP._peerReady=true;
-      // Connect to host
       const conn=MP.peer.connect(targetId,{reliable:true,serialization:'json'});
       MP._setupConn(conn);
       setMPStatus('Connecting to host…');
-      // Also accept reverse connections from other players
       MP.peer.on('connection',(c)=>MP._setupConn(c));
       conn.on('open',()=>finishJoin());
       conn.on('error',()=>setMPStatus('Could not reach host. Check the room code.'));
@@ -1303,7 +1405,6 @@ function joinMP(name,room){
   }
 
   function finishJoin(){
-    // Start AI racers for company
     startAIRacers();
     MP.active=true;
 
@@ -1315,11 +1416,9 @@ function joinMP(name,room){
     roomInfo.classList.add('show');
     document.getElementById('lobby-room-display').textContent='Room: '+MP.roomId;
 
-    // Update share code display if visible
     const scd=document.getElementById('share-code-display');
     if(scd) scd.textContent=MP.roomId;
 
-    // Position broadcast
     MP.broadcastInterval=setInterval(()=>{
       if(!MP.active)return;
       MP.broadcast({
@@ -1348,7 +1447,6 @@ function joinMP(name,room){
   saveToLS('gr_mp_name',MP.myName);
 }
 
-// Fallback: BroadcastChannel for same-device tabs
 function joinMPFallback(name,room){
   MP.myName=name||'Racer';
   const isCreating=!room||room.trim()==='';
@@ -1390,23 +1488,22 @@ function updateLB(){
   lb.innerHTML=all.map((p,i)=>`<div class="lb-row"><div class="lb-dot" style="background:${p.color||'#fff'}"></div><div class="lb-name${p.me?' lb-you':''}">${i+1}. ${p.name||'?'}</div><div class="lb-dist">${(p.distance).toFixed(1)}km</div></div>`).join('');
 }
 
-// ── PHYSICS STATE ── (autopilot OFF by default)
+// ── PHYSICS STATE ──
 const state={
   velocity:0,targetSpeed:60,heading:0,steer:0,steerInput:0,
   multiplier:1.0,smoothMult:1.0,pathIdx:2,
   autopilot:false,
   camMode:'chase',running:false,distance:0,wheelRot:0,
-  // Enhanced physics
-  lateralVel:0,       // sideways sliding velocity
-  grip:1.0,           // 0=full drift, 1=full grip
-  driftAngle:0,       // visual body slip angle
-  weightTransfer:0,   // front/rear load shift on accel/brake
-  turboBoost:0,       // brief boost after sustained accel
-  braking:false,      // is braking hard
-  roadCurvature:0,    // current road curve (for banking camera)
-  slipRatio:0,        // tyre slip ratio (drives skid audio+marks)
-  onRoad:true,        // whether car is on road surface
-  offRoadSlowdown:1.0 // grip reduction when off road
+  lateralVel:0,
+  grip:1.0,
+  driftAngle:0,
+  weightTransfer:0,
+  turboBoost:0,
+  braking:false,
+  roadCurvature:0,
+  slipRatio:0,
+  onRoad:true,
+  offRoadSlowdown:1.0
 };
 const camState={pos:new THREE.Vector3(0,4,10),lookAt:new THREE.Vector3(),orbitAngle:0,shake:0};
 const keys={up:false,down:false,left:false,right:false};
@@ -1432,29 +1529,19 @@ window.addEventListener('keyup',e=>{
   if(['ArrowRight','d','D'].includes(e.key)) keys.right=false;
 });
 
-// ── D-PAD TOUCH BINDING (reliable multi-touch) ──
+// ── D-PAD TOUCH BINDING ──
 function bindTouchBtn(el,dir){
   if(!el) return;
-  // Prevent ghost clicks
   el.addEventListener('touchstart',e=>{
-    e.preventDefault();
-    e.stopPropagation();
-    keys[dir]=true;
-    el.classList.add('pressed');
-    initAudio();
+    e.preventDefault();e.stopPropagation();
+    keys[dir]=true;el.classList.add('pressed');initAudio();
     if(navigator.vibrate && document.getElementById('toggle-haptic')?.checked) navigator.vibrate(15);
   },{passive:false});
   el.addEventListener('touchend',e=>{
-    e.preventDefault();
-    e.stopPropagation();
-    keys[dir]=false;
-    el.classList.remove('pressed');
+    e.preventDefault();e.stopPropagation();
+    keys[dir]=false;el.classList.remove('pressed');
   },{passive:false});
-  el.addEventListener('touchcancel',e=>{
-    keys[dir]=false;
-    el.classList.remove('pressed');
-  },{passive:false});
-  // Mouse fallback for desktop testing
+  el.addEventListener('touchcancel',e=>{keys[dir]=false;el.classList.remove('pressed');},{passive:false});
   el.addEventListener('mousedown',e=>{keys[dir]=true;el.classList.add('pressed');initAudio();});
   el.addEventListener('mouseup',e=>{keys[dir]=false;el.classList.remove('pressed');});
   el.addEventListener('mouseleave',e=>{keys[dir]=false;el.classList.remove('pressed');});
@@ -1467,7 +1554,6 @@ bindTouchBtn(document.getElementById('dp-right'),'right');
 bindTouchBtn(document.getElementById('btn-gas'),'up');
 bindTouchBtn(document.getElementById('btn-brake'),'down');
 
-// Prevent scroll on controls
 ['dpad','mobile-accel'].forEach(id=>{
   const el=document.getElementById(id);
   if(el) el.addEventListener('touchmove',e=>e.preventDefault(),{passive:false});
@@ -1503,35 +1589,27 @@ function updatePhysics(dt){
   if(state.autopilot) updateAP(dt,st);
   else updateManual(dt,st);
 
-  // Wheel spin
   state.wheelRot+=state.velocity*dt*2.8;
   wheelMeshes.forEach(w=>{ w.rotation.x=state.wheelRot; });
 
-  // Front wheel steering angle
   const sv=clamp(state.steer*0.55,-0.55,0.55);
   wheelMeshes[0].rotation.y=sv; wheelMeshes[1].rotation.y=sv;
 
-  // Body roll from lateral forces
   const lateralG = state.steer * Math.abs(state.velocity) * 0.18;
   carGroup.rotation.z = lerp(carGroup.rotation.z, -lateralG * 0.38, Math.min(1,dt*6));
 
-  // Drift body angle (visual slip)
   carGroup.rotation.y = state.heading + state.driftAngle * 0.6;
 
-  // Nose dip/rise on brake/accel (weight transfer)
   const pitchTarget = state.weightTransfer * 0.04;
   carGroup.rotation.x = lerp(carGroup.rotation.x, pitchTarget, Math.min(1,dt*5));
 
-  // Road height tracking
   const cp=getPt(state.pathIdx);
   if(cp) carGroup.position.y=lerp(carGroup.position.y,cp.y+.36,Math.min(1,dt*8));
 
   state.distance+=Math.abs(state.velocity)*dt*3.6*.001;
 
-  // Skid marks when slipping
   if(state.slipRatio>0.25 && !state.autopilot) addSkidMark();
 
-  // Camera shake on hard braking
   if(state.braking && Math.abs(state.velocity)>0.5) camState.shake=lerp(camState.shake,0.06,0.3);
   else camState.shake=lerp(camState.shake,0,0.12);
 
@@ -1543,7 +1621,6 @@ function updateManual(dt,st){
   const spd=Math.abs(state.velocity);
   const speedFactor=clamp(spd/Math.max(0.3,st),0,1);
 
-  // ── ACCELERATION / BRAKING ──
   if(keys.up){
     const accelForce = state.grip * (state.turboBoost>0 ? 1.18 : 1.0);
     state.velocity=lerp(state.velocity, st*accelForce, Math.min(1,dt*2.8));
@@ -1556,13 +1633,11 @@ function updateManual(dt,st){
     state.weightTransfer=lerp(state.weightTransfer,1,Math.min(1,dt*5));
     state.braking=spd>0.25;
   } else {
-    // Coasting — gentle decel
     state.velocity=lerp(state.velocity, st*0.38, Math.min(1,dt*1.1));
     state.weightTransfer=lerp(state.weightTransfer,0,Math.min(1,dt*3));
     state.braking=false;
   }
 
-  // ── STEERING — speed-sensitive, tighter at low speed ──
   const steerMax = 0.048 * (1.0 - speedFactor*0.42) / Math.max(0.3,state.smoothMult);
   const steerResponse = keys.left||keys.right ? (0.18 + (1-speedFactor)*0.22) : 0;
 
@@ -1572,39 +1647,30 @@ function updateManual(dt,st){
 
   state.steerInput = clamp(state.steerInput,-steerMax,steerMax);
 
-  // ── GRIP / DRIFT MODEL ──
   const steerMag = Math.abs(state.steerInput);
   const latForce = steerMag * speedFactor;
-  // Tyre grip degrades at high lateral force
   const gripTarget = clamp(1.0 - latForce*8.5 + (keys.up?0.15:0), 0.18, 1.0);
   state.grip = lerp(state.grip, gripTarget, Math.min(1,dt*5));
 
-  // Lateral velocity (sliding)
   const latAccel = state.steerInput * state.velocity * 5.5 * (1-state.grip*0.72);
   state.lateralVel = lerp(state.lateralVel, latAccel, Math.min(1,dt*(state.grip*4+1)));
   state.lateralVel *= (1 - dt * (state.grip*3+0.5));
 
-  // Slip ratio for skids
   state.slipRatio = clamp(Math.abs(state.lateralVel)*0.8 + (state.braking?spd*0.4:0), 0, 1);
 
-  // Drift angle — body lag behind heading
   const driftTarget = state.lateralVel * 0.22;
   state.driftAngle = lerp(state.driftAngle, driftTarget, Math.min(1,dt*3.5));
 
-  // ── HEADING UPDATE ──
   state.steer = lerp(state.steer, state.steerInput, 0.28);
-  // Heading turns less when drifting
   const yawRate = state.steer * state.velocity * dt * (5.5 + state.grip*1.8);
   state.heading += yawRate;
 
-  // ── POSITION ──
   const latRight = state.heading + Math.PI/2;
   carGroup.position.x += Math.sin(state.heading)*state.velocity*dt*3.6 + Math.sin(latRight)*state.lateralVel*dt*0.5;
   carGroup.position.z -= Math.cos(state.heading)*state.velocity*dt*3.6 + Math.cos(latRight)*state.lateralVel*dt*0.5;
 
   state.pathIdx=closestIdx(carGroup.position.x,carGroup.position.z,state.pathIdx);
 
-  // Road curvature lookahead for camera banking
   const aheadPt=getPt(state.pathIdx+8);
   const nowPt=getPt(state.pathIdx);
   if(aheadPt&&nowPt) state.roadCurvature=lerp(state.roadCurvature,(aheadPt.yaw-nowPt.yaw)*6,Math.min(1,dt*3));
@@ -1631,7 +1697,6 @@ function updateCamera(dt){
   const shakeY=Math.abs(Math.random()-.5)*camState.shake;
   if(state.camMode==='chase'){
     const d=8+state.smoothMult*1.4,h=3.2;
-    // Banking effect on curves
     const bankTarget = state.roadCurvature * 0.055 + state.driftAngle*0.04;
     camState.pos.lerp(new THREE.Vector3(cp.x-Math.sin(ch)*d,cp.y+h,cp.z+Math.cos(ch)*d),Math.min(1,dt*cs));
     camState.lookAt.set(cp.x+Math.sin(ch)*5,cp.y+.8,cp.z-Math.cos(ch)*5);
@@ -1640,7 +1705,6 @@ function updateCamera(dt){
     camera.lookAt(camState.lookAt);
     camera.rotation.z=lerp(camera.rotation.z, bankTarget, Math.min(1,dt*3.5));
   } else if(state.camMode==='driver'){
-    // Slight head bob
     const bob=Math.sin(state.wheelRot*1.1)*0.012*clamp(Math.abs(state.velocity)*0.5,0,1);
     camState.pos.lerp(new THREE.Vector3(cp.x+Math.sin(ch)*.5,cp.y+1.25+bob,cp.z-Math.cos(ch)*.5),Math.min(1,dt*14));
     camState.lookAt.set(cp.x+Math.sin(ch)*30,cp.y+1,cp.z-Math.cos(ch)*30);
@@ -1659,7 +1723,6 @@ function updateCamera(dt){
 
 function updateRoad(){
   const carPt=carGroup.position;
-  // Extend path ahead generously
   while(path.length<state.pathIdx+300) extendPath(30);
 
   const lastIdx=segActive.length>0?segActive[segActive.length-1].userData.pathIdx:0;
@@ -1669,7 +1732,6 @@ function updateRoad(){
     if(i%3===0&&decPool.length>0) placeDec(path[i]);
   }
 
-  // Recycle segments behind car
   for(let i=segActive.length-1;i>=0;i--){
     const seg=segActive[i];
     const pt=path[seg.userData.pathIdx];
@@ -1677,7 +1739,6 @@ function updateRoad(){
       seg.visible=false;segPool.push(seg);segActive.splice(i,1);
     }
   }
-  // Recycle decorations
   for(let i=decActive.length-1;i>=0;i--){
     const d=decActive[i];
     if(d.position.z-carPt.z>120){
@@ -1698,10 +1759,8 @@ function updateHUD(){
   lbFrame++;
   if(lbFrame%25===0){
     updateLB();
-    // Prune stale real players
     if(MP.active){
       Object.entries(MP.players).forEach(([id,p])=>{
-        // Keep AI racers alive
         if(id.startsWith('ai_')) return;
         if(Date.now()-p.lastSeen>10000){delete MP.players[id];if(otherMeshes[id])otherMeshes[id].visible=false;}
       });
@@ -1728,16 +1787,13 @@ function startGame(withMP){
   document.getElementById('intro').classList.add('fade');
   setTimeout(()=>document.getElementById('intro').style.display='none',900);
   state.running=true;
-  // Autopilot OFF by default, user drives manually
   state.autopilot=false;
   document.getElementById('ap-badge').classList.remove('show');
   document.getElementById('btn-ap').classList.remove('active');
   updateLB();
   initAudio();
-  // Put car at start of path
   const pt=getPt(state.pathIdx);
   if(pt){carGroup.position.set(pt.x,pt.y+.36,pt.z);carGroup.rotation.y=-pt.yaw;}
-  // Give a little auto-roll for first 2 secs
   setTimeout(()=>{if(!keys.up&&!keys.down)keys.up=true;setTimeout(()=>keys.up=false,200);},500);
 }
 
@@ -1792,7 +1848,6 @@ document.querySelectorAll('[data-diff]').forEach(p=>p.addEventListener('click',(
   p.classList.add('active');diff=p.dataset.diff;
 }));
 
-// Autopilot toggle — user must click to enable
 function toggleAP(){
   state.autopilot=!state.autopilot;
   document.getElementById('ap-badge').classList.toggle('show',state.autopilot);
@@ -1835,12 +1890,10 @@ document.getElementById('lobby-join-btn').addEventListener('click',()=>{
     setTimeout(()=>document.getElementById('intro').style.display='none',900);
   }
   joinMP(name,room);
-  // Show room code share UI once room is created
   const isCreating=!room;
   if(isCreating){
     document.getElementById('room-code-share').style.display='block';
     document.getElementById('share-code-display').textContent='…';
-    // Will be updated by setMPStatus
     const obs=new MutationObserver(()=>{
       if(MP.roomId) document.getElementById('share-code-display').textContent=MP.roomId;
     });
@@ -1850,7 +1903,6 @@ document.getElementById('lobby-join-btn').addEventListener('click',()=>{
   updateLB();
 });
 
-// Copy room code to clipboard
 document.getElementById('copy-code-btn').addEventListener('click',()=>{
   const code=MP.roomId;
   if(!code) return;
@@ -1867,18 +1919,33 @@ document.getElementById('btn-mp').addEventListener('click',()=>{
   else openLobby();
 });
 
-// ── MUSIC PANEL ──
+// ── MUSIC PANEL WIRING ──
 document.getElementById('btn-music').addEventListener('click',()=>{
   const panel=document.getElementById('music-panel');
   panel.classList.toggle('show');
+  // Init audio context on user interaction
   if(panel.classList.contains('show')) initAudio();
 });
-document.getElementById('music-close-btn').addEventListener('click',()=>document.getElementById('music-panel').classList.remove('show'));
-document.getElementById('btn-play-pause').addEventListener('click',()=>{initAudio();musicPlayer.togglePlay();});
+document.getElementById('music-close-btn').addEventListener('click',()=>{
+  document.getElementById('music-panel').classList.remove('show');
+});
+
+document.getElementById('btn-play-pause').addEventListener('click',()=>{
+  initAudio();
+  musicPlayer._connectToAudioCtx();
+  musicPlayer.togglePlay();
+});
 document.getElementById('btn-next').addEventListener('click',()=>musicPlayer.next());
 document.getElementById('btn-prev').addEventListener('click',()=>musicPlayer.prev());
-document.getElementById('btn-shuffle').addEventListener('click',function(){musicPlayer.shuffle=!musicPlayer.shuffle;this.style.color=musicPlayer.shuffle?'#ffc850':'';});
-document.getElementById('btn-loop').addEventListener('click',function(){musicPlayer.loop=!musicPlayer.loop;this.style.color=musicPlayer.loop?'#ffc850':'';});
+document.getElementById('btn-shuffle').addEventListener('click',function(){
+  musicPlayer.shuffle=!musicPlayer.shuffle;
+  this.style.color=musicPlayer.shuffle?'#ffc850':'';
+});
+document.getElementById('btn-loop').addEventListener('click',function(){
+  musicPlayer.loop=!musicPlayer.loop;
+  this.style.color=musicPlayer.loop?'#ffc850':'';
+});
+
 document.getElementById('music-vol').addEventListener('input',e=>{
   const v=e.target.value/100;
   musicPlayer.setVolume(v);
@@ -1886,9 +1953,16 @@ document.getElementById('music-vol').addEventListener('input',e=>{
   document.getElementById('settings-music-val').textContent=e.target.value+'%';
   saveToLS('gr_music_vol',e.target.value);
 });
+
+// File input — session temp storage using blob URLs
 document.getElementById('music-file-input').addEventListener('change',e=>{
-  if(e.target.files.length) musicPlayer.addFiles(e.target.files);
+  if(e.target.files.length){
+    musicPlayer.addFiles(e.target.files);
+    // Reset input so same files can be re-added if needed
+    e.target.value = '';
+  }
 });
+
 document.getElementById('music-progress-bar').addEventListener('click',e=>{
   if(!musicPlayer.audio||!musicPlayer.audio.duration)return;
   const r=e.currentTarget.getBoundingClientRect();
@@ -1911,7 +1985,7 @@ document.getElementById('settings-panel').addEventListener('click',e=>{
   }
 });
 
-// SFX sliders — start at 8%
+// SFX sliders
 document.getElementById('sfx-engine-vol').addEventListener('input',e=>{
   sfxSettings.engineVol=e.target.value/100;
   document.getElementById('sfx-engine-val').textContent=e.target.value+'%';
@@ -1966,7 +2040,6 @@ document.querySelectorAll('.ctrl-opt').forEach(opt=>{
   });
 });
 
-// Show/hide dpad on PC toggle
 document.getElementById('toggle-dpad-pc').addEventListener('change',e=>{
   const dpad=document.getElementById('dpad');const accel=document.getElementById('mobile-accel');
   if(e.target.checked){dpad.style.display='flex';accel.style.display='flex';}
